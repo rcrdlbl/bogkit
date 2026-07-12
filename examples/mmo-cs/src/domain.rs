@@ -96,6 +96,12 @@ pub enum BattleOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Battle {
     pub id: u64,
+    /// Secret that gates host-only actions (`ConfigureBattle`, `StartBattle`)
+    /// for this match — see `matches::Registry` and `web.rs`'s `/match/:id/host/:token`
+    /// route. Persisted here (rather than only held in memory) so a battle
+    /// resumed after a restart keeps the same host link instead of orphaning
+    /// whoever created it.
+    pub host_token: String,
     /// `None` until someone configures the match (see
     /// `ClientMsg::ConfigureBattle`) — the client shows a park-search +
     /// duration menu while this is unset, and the join/start lobby once
@@ -123,4 +129,20 @@ pub struct Scoreboard {
     pub battle: Battle,
     pub court_square: TeamStats,
     pub church_ave: TeamStats,
+}
+
+/// A lightweight, non-secret rollup of one match for the homepage's
+/// browsable list — deliberately thinner than `Scoreboard` (no
+/// `host_token`, no live presence counts) since every match thread
+/// publishes one of these into a registry shared across all matches.
+#[derive(Debug, Clone, Serialize)]
+pub struct MatchSummary {
+    pub id: u64,
+    pub park_name: Option<String>,
+    pub status: BattleStatus,
+    pub court_square_members: u32,
+    pub church_ave_members: u32,
+    pub started_at_ms: Option<u64>,
+    pub ends_at_ms: Option<u64>,
+    pub outcome: Option<BattleOutcome>,
 }

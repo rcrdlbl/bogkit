@@ -75,7 +75,9 @@ pub fn check_elimination(
 
     match confirmed.as_slice() {
         [] => None,
-        [team] => Some(BattleOutcome::Elimination { winner: team.opponent() }),
+        [team] => Some(BattleOutcome::Elimination {
+            winner: team.opponent(),
+        }),
         // both teams confirmed fully swept in the same tick: neither
         // controls the battleground, so it's an explicit tie rather than
         // a pick that would otherwise depend on iteration order
@@ -89,13 +91,21 @@ pub fn check_elimination(
 pub fn check_timeout(court_square: TeamSnapshot, church_ave: TeamSnapshot) -> BattleOutcome {
     let (cs_pct, ca_pct) = (court_square.pct(), church_ave.pct());
     if cs_pct > ca_pct {
-        BattleOutcome::Timeout { winner: Team::CourtSquare }
+        BattleOutcome::Timeout {
+            winner: Team::CourtSquare,
+        }
     } else if ca_pct > cs_pct {
-        BattleOutcome::Timeout { winner: Team::ChurchAve }
+        BattleOutcome::Timeout {
+            winner: Team::ChurchAve,
+        }
     } else if court_square.in_bounds > church_ave.in_bounds {
-        BattleOutcome::Timeout { winner: Team::CourtSquare }
+        BattleOutcome::Timeout {
+            winner: Team::CourtSquare,
+        }
     } else if church_ave.in_bounds > court_square.in_bounds {
-        BattleOutcome::Timeout { winner: Team::ChurchAve }
+        BattleOutcome::Timeout {
+            winner: Team::ChurchAve,
+        }
     } else {
         BattleOutcome::Tie
     }
@@ -106,7 +116,11 @@ mod tests {
     use super::*;
 
     fn snap(members: i64, pinging: i64, in_bounds: i64) -> TeamSnapshot {
-        TeamSnapshot { members, pinging, in_bounds }
+        TeamSnapshot {
+            members,
+            pinging,
+            in_bounds,
+        }
     }
 
     #[test]
@@ -128,7 +142,12 @@ mod tests {
             (Team::ChurchAve, snap(1, 1, 0)),
         ];
         let outcome = check_elimination(ELIMINATION_CONFIRM_MS, &mut zero_since, snapshots);
-        assert_eq!(outcome, Some(BattleOutcome::Elimination { winner: Team::CourtSquare }));
+        assert_eq!(
+            outcome,
+            Some(BattleOutcome::Elimination {
+                winner: Team::CourtSquare
+            })
+        );
     }
 
     #[test]
@@ -168,13 +187,23 @@ mod tests {
     #[test]
     fn timeout_picks_the_higher_percentage() {
         let outcome = check_timeout(snap(2, 0, 2), snap(2, 0, 1)); // 100% vs 50%
-        assert_eq!(outcome, BattleOutcome::Timeout { winner: Team::CourtSquare });
+        assert_eq!(
+            outcome,
+            BattleOutcome::Timeout {
+                winner: Team::CourtSquare
+            }
+        );
     }
 
     #[test]
     fn timeout_tiebreaks_equal_percentage_by_headcount() {
         let outcome = check_timeout(snap(2, 0, 2), snap(1, 0, 1)); // both 100%, cs has more bodies
-        assert_eq!(outcome, BattleOutcome::Timeout { winner: Team::CourtSquare });
+        assert_eq!(
+            outcome,
+            BattleOutcome::Timeout {
+                winner: Team::CourtSquare
+            }
+        );
     }
 
     #[test]
