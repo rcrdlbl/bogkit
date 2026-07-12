@@ -198,5 +198,15 @@
       "max_lon": -73.8832,
       "max_lat": 40.691266
     }
+  },
+  {
+    "id": "H001",
+    "name": "Dean St (3rd Ave-4th Ave)",
+    "bbox": {
+      "min_lon": -73.981862,
+      "min_lat": 40.682844,
+      "max_lon": -73.978931,
+      "max_lat": 40.684353
+    }
   }
 ]
