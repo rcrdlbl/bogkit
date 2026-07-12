@@ -47,4 +47,10 @@ pub enum ClientMsg {
     /// Host-only; a no-op unless the battle is `Pending` and both teams
     /// have at least one member.
     StartBattle,
+    /// Checks for opposing-team players within the scan tool's radius.
+    /// Not host-only. `web.rs` intercepts this variant before it ever
+    /// reaches the ingest thread as a plain `ClientMsg` — it needs a
+    /// private reply channel (see `battle::IngestMsg`), which a
+    /// `Deserialize` wire type can't hold.
+    ScanNearby { player: PlayerId },
 }

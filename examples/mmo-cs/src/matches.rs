@@ -17,15 +17,15 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
 use crate::battle;
+use crate::battle::IngestMsg;
 use crate::domain::{Battle, BattleStatus, MatchSummary, Scoreboard, TeamStats};
-use crate::protocol::ClientMsg;
 
 /// A running match's channels, cloned out of the registry for whichever
 /// request needs them — `mpsc::Sender`/`watch::Receiver` are both cheap to
 /// clone, so callers never hold the registry's lock while using them.
 #[derive(Clone)]
 pub struct MatchHandle {
-    pub msg_tx: mpsc::Sender<ClientMsg>,
+    pub msg_tx: mpsc::Sender<IngestMsg>,
     pub state_rx: watch::Receiver<Scoreboard>,
     pub host_token: String,
 }
