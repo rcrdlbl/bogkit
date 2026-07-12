@@ -56,7 +56,19 @@ use crate::domain::{
 };
 use crate::parks;
 use crate::protocol::ClientMsg;
+use crate::scan::{self, ScanOutcome};
 use crate::win;
+
+/// What actually flows through a match's ingest channel. Almost always a
+/// plain wire message, but `ClientMsg::ScanNearby` needs a private reply
+/// routed back to only the requesting connection — something a
+/// `Deserialize` wire type can't carry — so `web.rs` unwraps that one
+/// variant into its own case with a one-shot reply channel attached,
+/// instead of ever forwarding it as `Client(ClientMsg::ScanNearby { .. })`.
+pub enum IngestMsg {
+    Client(ClientMsg),
+    ScanNearby { player: PlayerId, reply: tokio::sync::oneshot::Sender<ScanOutcome> },
+}
 
 /// A player's ping counts as live only if it arrived within this long.
 const PRESENCE_HORIZON: Duration = Duration::from_secs(45);
@@ -157,7 +169,7 @@ pub fn run_match(
     id: u64,
     host_token: String,
     resume: Option<Battle>,
-    rx: mpsc::Receiver<ClientMsg>,
+    rx: mpsc::Receiver<IngestMsg>,
     state_tx: watch::Sender<Scoreboard>,
     lobby: Arc<watch::Sender<HashMap<u64, MatchSummary>>>,
 ) {
@@ -268,10 +280,10 @@ pub fn run_match(
 
         loop {
             match rx.recv_timeout(TICK) {
-                Ok(ClientMsg::ConfigureBattle {
+                Ok(IngestMsg::Client(ClientMsg::ConfigureBattle {
                     park_id,
                     duration_secs,
-                }) => {
+                })) => {
                     if let Some(park) = parks::find_by_id(&park_id) {
                         let duration_ms = duration_override_ms.unwrap_or_else(|| {
                             duration_secs.clamp(MIN_BATTLE_DURATION_SECS, MAX_BATTLE_DURATION_SECS)
@@ -285,7 +297,7 @@ pub fn run_match(
                         battle.duration_ms = Some(duration_ms);
                     }
                 }
-                Ok(ClientMsg::Join { player, team }) => {
+                Ok(IngestMsg::Client(ClientMsg::Join { player, team })) => {
                     roster.wtx(|tx| {
                         tx.upsert(
                             &player,
@@ -296,7 +308,11 @@ pub fn run_match(
                         )
                     });
                 }
-                Ok(ClientMsg::Ping { .. } | ClientMsg::StartBattle) => {} // no park chosen yet
+                // no park chosen yet, so no battle to ping/start/scan against
+                Ok(IngestMsg::Client(ClientMsg::Ping { .. } | ClientMsg::StartBattle | ClientMsg::ScanNearby { .. })) => {}
+                Ok(IngestMsg::ScanNearby { reply, .. }) => {
+                    let _ = reply.send(ScanOutcome::Unavailable);
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
             }
@@ -314,28 +330,34 @@ pub fn run_match(
     let bbox = battle.park.as_ref().expect("configured in phase 1").bbox;
     let duration_ms = battle.duration_ms.expect("configured in phase 1");
 
-    // Presence pipeline: Retain(liveness) -> KeyBy(team) + Aggregate(in/out
-    // counts) -> Table<Team, PresenceCounts>. `bbox` is captured by the
-    // step closure at construction time, since it differs per battle.
+    // Presence pipeline: Retain(liveness) fans out to two branches —
+    // KeyBy(team) + Aggregate(in/out counts) -> Table<Team, PresenceCounts>
+    // (for the scoreboard), and a plain Table<PlayerId, LocationPing> (for
+    // the nearby-opponent scan tool, which needs every live player's last
+    // fix, not just team totals). `bbox` is captured by the aggregate step
+    // closure at construction time, since it differs per battle.
     let mut presence = KeyedStream::new(
         battle_dir.join("presence.db"),
         Retain::new(
             "presence_ttl",
             PRESENCE_HORIZON,
-            KeyBy::new(
-                |d: &Keyed<PlayerId, LocationPing>| d.val.team,
-                Aggregate::new(
-                    "presence_by_team",
-                    move |acc: &mut PresenceCounts,
-                          ping: &Keyed<PlayerId, LocationPing>,
-                          delta: isize| {
-                        acc.pinging += delta as i64;
-                        if bbox.contains(ping.val.lon, ping.val.lat) {
-                            acc.in_bounds += delta as i64;
-                        }
-                    },
-                    Table::new("presence_counts"),
+            (
+                KeyBy::new(
+                    |d: &Keyed<PlayerId, LocationPing>| d.val.team,
+                    Aggregate::new(
+                        "presence_by_team",
+                        move |acc: &mut PresenceCounts,
+                              ping: &Keyed<PlayerId, LocationPing>,
+                              delta: isize| {
+                            acc.pinging += delta as i64;
+                            if bbox.contains(ping.val.lon, ping.val.lat) {
+                                acc.in_bounds += delta as i64;
+                            }
+                        },
+                        Table::new("presence_counts"),
+                    ),
                 ),
+                Table::new("presence_rows"),
             ),
         ),
     );
@@ -346,9 +368,16 @@ pub fn run_match(
     // doc comment for why that's fine.
     let mut zero_since: HashMap<Team, u64> = HashMap::new();
 
+    // player -> instant of their last successful nearby-opponent scan;
+    // gates the 5-minute cooldown (see `crate::scan`). Same discipline as
+    // `zero_since`: plain in-memory, not persisted, always starts empty
+    // (including on resume) — a debounce timer resetting across a restart
+    // only costs an early-available scan, never a wrong answer.
+    let mut last_scan_ms: HashMap<PlayerId, u64> = HashMap::new();
+
     macro_rules! presence_counts {
         ($team:expr) => {{
-            let pc: PresenceCounts = presence.rtx(|t| t.get(&$team)).unwrap_or_default();
+            let pc: PresenceCounts = presence.rtx(|(t, _rows)| t.get(&$team)).unwrap_or_default();
             pc
         }};
     }
@@ -386,8 +415,8 @@ pub fn run_match(
 
     loop {
         match rx.recv_timeout(TICK) {
-            Ok(ClientMsg::ConfigureBattle { .. }) => {} // locked once a park is chosen
-            Ok(ClientMsg::Join { player, team }) => {
+            Ok(IngestMsg::Client(ClientMsg::ConfigureBattle { .. })) => {} // locked once a park is chosen
+            Ok(IngestMsg::Client(ClientMsg::Join { player, team })) => {
                 // roster locks once Active: no late joins / team-switches
                 // mid-battle, so a losing team can't stack reinforcements
                 if battle.status == BattleStatus::Pending {
@@ -402,12 +431,12 @@ pub fn run_match(
                     });
                 }
             }
-            Ok(ClientMsg::Ping {
+            Ok(IngestMsg::Client(ClientMsg::Ping {
                 player,
                 lat,
                 lon,
                 client_ms,
-            }) => {
+            })) => {
                 // team is looked up server-side from the roster, never
                 // trusted from the client, so a ping can't claim a team
                 // the player didn't actually join
@@ -427,7 +456,7 @@ pub fn run_match(
                     });
                 }
             }
-            Ok(ClientMsg::StartBattle) => {
+            Ok(IngestMsg::Client(ClientMsg::StartBattle)) => {
                 if battle.status == BattleStatus::Pending {
                     let cs = roster_count!(Team::CourtSquare);
                     let ca = roster_count!(Team::ChurchAve);
@@ -438,6 +467,42 @@ pub fn run_match(
                         battle.ends_at_ms = Some(start + duration_ms);
                     }
                 }
+            }
+            // web.rs always routes a scan request through IngestMsg::ScanNearby
+            // with its reply channel attached, never through this variant.
+            Ok(IngestMsg::Client(ClientMsg::ScanNearby { .. })) => {}
+            Ok(IngestMsg::ScanNearby { player, reply }) => {
+                let outcome = if battle.status == BattleStatus::Active {
+                    let my_team = roster.get(&player).map(|e| e.team);
+                    let my_fix = my_team.and_then(|_| presence.get(&player)).map(|p| scan::GeoPoint {
+                        lat: p.lat,
+                        lon: p.lon,
+                    });
+                    let opponent_fixes = my_team
+                        .map(|team| {
+                            let opponent = team.opponent();
+                            presence.rtx(|(_counts, rows)| {
+                                rows.iter()
+                                    .filter(|(pid, ping)| *pid != player && ping.team == opponent)
+                                    .map(|(_, ping)| scan::GeoPoint { lat: ping.lat, lon: ping.lon })
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .unwrap_or_default();
+                    let outcome = scan::decide_scan(
+                        now_ms(),
+                        last_scan_ms.get(&player).copied(),
+                        my_fix,
+                        &opponent_fixes,
+                    );
+                    if matches!(outcome, ScanOutcome::NearbyCount { .. }) {
+                        last_scan_ms.insert(player.clone(), now_ms());
+                    }
+                    outcome
+                } else {
+                    ScanOutcome::Unavailable
+                };
+                let _ = reply.send(outcome);
             }
             Err(RecvTimeoutError::Timeout) => {
                 // no-op write: advances Retain's clock, expiring stale pings

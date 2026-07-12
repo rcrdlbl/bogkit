@@ -34,6 +34,7 @@ use qrcode::render::svg;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
+use crate::battle::IngestMsg;
 use crate::domain::{MatchSummary, Scoreboard};
 use crate::matches::Registry;
 use crate::parks;
@@ -130,7 +131,7 @@ async fn match_ws_upgrade(
 /// client message into the match's ingest thread.
 async fn handle_socket(
     mut socket: WebSocket,
-    msg_tx: mpsc::Sender<ClientMsg>,
+    msg_tx: mpsc::Sender<IngestMsg>,
     mut state_rx: watch::Receiver<Scoreboard>,
     is_host: bool,
 ) {
@@ -157,6 +158,26 @@ async fn handle_socket(
                     return; // client closed or errored
                 };
                 match serde_json::from_str::<ClientMsg>(&text) {
+                    // Needs a private reply routed back to only this
+                    // connection, not the shared Scoreboard broadcast — so
+                    // it's sent as its own `IngestMsg` variant carrying a
+                    // one-shot reply channel, and the result is written
+                    // straight back to this socket once the match thread
+                    // answers, alongside (not instead of) the regular
+                    // Scoreboard pushes this task keeps forwarding. Not
+                    // host-only, so no gating needed here.
+                    Ok(ClientMsg::ScanNearby { player }) => {
+                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                        if msg_tx.send(IngestMsg::ScanNearby { player, reply: reply_tx }).is_err() {
+                            return; // match thread gone
+                        }
+                        let Ok(outcome) = reply_rx.await else {
+                            return; // match thread gone
+                        };
+                        if socket.send(Message::text(serde_json::to_string(&outcome).unwrap())).await.is_err() {
+                            return;
+                        }
+                    }
                     Ok(msg) => {
                         let host_only = matches!(
                             msg,
@@ -164,7 +185,7 @@ async fn handle_socket(
                         );
                         if host_only && !is_host {
                             eprintln!("dropping host-only message from a non-host connection");
-                        } else if msg_tx.send(msg).is_err() {
+                        } else if msg_tx.send(IngestMsg::Client(msg)).is_err() {
                             return; // match thread gone
                         }
                     }
@@ -377,6 +398,9 @@ const MATCH_PAGE_TEMPLATE: &str = r#"<!doctype html>
   #qr-invite img { border: 1px solid #ddd; border-radius: 6px; }
   #qr-invite p { margin: 0 0 0.4rem; color: #555; font-size: 0.9rem; }
   #back-home { color: #555; font-size: 0.9rem; }
+  #scan-tool { margin: 1rem 0; }
+  #scan-btn { width: 100%; padding: 0.6rem; font-size: 1rem; }
+  #scan-result { margin-top: 0.4rem; font-weight: bold; }
 </style>
 </head>
 <body>
@@ -400,6 +424,10 @@ const MATCH_PAGE_TEMPLATE: &str = r#"<!doctype html>
 </div>
 
 <div id="my-status"></div>
+<div id="scan-tool" style="display:none">
+  <button id="scan-btn">scan for nearby opponents (20ft)</button>
+  <div id="scan-result"></div>
+</div>
 <div id="banner"></div>
 <div id="qr-invite" style="display:none">
   <p>scan to join on your phone</p>
@@ -433,6 +461,11 @@ const IS_HOST = __IS_HOST__; // the host configures + starts the match but never
 const HOST_TOKEN = "__HOST_TOKEN__";
 const PLAYER_KEY = `mmo_player_id`;
 const TEAM_KEY = `mmo_team_${MATCH_ID}`;
+// Mirrors scan::SCAN_COOLDOWN_MS — only an optimistic estimate for the
+// countdown display; the server's authoritative remaining_ms (sent on an
+// on_cooldown reply) always overrides it, so client/server drift never
+// under-counts the real cooldown.
+const SCAN_COOLDOWN_MS = 5 * 60 * 1000;
 
 let playerId = localStorage.getItem(PLAYER_KEY);
 if (!playerId) {
@@ -445,6 +478,8 @@ let latest = null; // last scoreboard from the server
 let watchId = null;
 let lastPingAt = 0;
 let lastFix = null; // { lat, lon } from the most recent geolocation fix
+let scanCooldownUntil = 0; // Date.now()-comparable instant the scan button re-enables
+let scanPending = false; // true while a scan_nearby request is in flight
 
 const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
 const wsUrl = IS_HOST
@@ -464,6 +499,12 @@ document.getElementById("qr-img").src =
 document.getElementById("join-court_square").onclick = () => join("court_square");
 document.getElementById("join-church_ave").onclick = () => join("church_ave");
 document.getElementById("start").onclick = () => send({ type: "start_battle" });
+document.getElementById("scan-btn").onclick = () => {
+  if (IS_HOST || scanPending || Date.now() < scanCooldownUntil) return;
+  scanPending = true;
+  renderScanTool();
+  send({ type: "scan_nearby", player: playerId });
+};
 
 function join(team) {
   if (IS_HOST) return; // the host never joins a team
@@ -567,6 +608,45 @@ function renderMyStatus() {
   el.className = inside ? "in" : "out";
 }
 
+// Shown only while actively streaming, same gate as #my-status — never
+// applies to the host either. The button itself disables during the
+// 5-minute server-enforced cooldown; the actual result text is set by
+// handleScanReply once a reply arrives.
+function renderScanTool() {
+  const tool = document.getElementById("scan-tool");
+  if (IS_HOST || !latest || !myTeam || !latest.battle.park || latest.battle.status !== "active") {
+    tool.style.display = "none";
+    return;
+  }
+  tool.style.display = "";
+  const btn = document.getElementById("scan-btn");
+  const onCooldown = Date.now() < scanCooldownUntil;
+  btn.disabled = scanPending || onCooldown;
+  btn.textContent = onCooldown
+    ? `scan again in ${fmtCountdown(scanCooldownUntil - Date.now())}`
+    : "scan for nearby opponents (20ft)";
+}
+
+// A scan_nearby reply, routed here by ws.onmessage instead of into `latest`
+// (it's a private one-off answer to this connection's request, not a
+// Scoreboard push).
+function handleScanReply(data) {
+  scanPending = false;
+  const el = document.getElementById("scan-result");
+  if (data.type === "nearby_count") {
+    el.textContent = data.count > 0
+      ? `⚠️ ${data.count} opponent${data.count === 1 ? "" : "s"} within 20ft!`
+      : "no opponents detected nearby";
+    scanCooldownUntil = Date.now() + SCAN_COOLDOWN_MS;
+  } else if (data.type === "on_cooldown") {
+    // server-authoritative remaining time overrides our optimistic estimate
+    scanCooldownUntil = Date.now() + data.remaining_ms;
+  } else {
+    el.textContent = "can't scan right now";
+  }
+  renderScanTool();
+}
+
 function fmtCountdown(ms) {
   if (ms <= 0) return "0:00:00";
   const totalSec = Math.floor(ms / 1000);
@@ -596,6 +676,7 @@ function render() {
     qrInvite.style.display = "none";
     banner.classList.remove("show");
     document.getElementById("my-status").textContent = "";
+    document.getElementById("scan-tool").style.display = "none";
     if (IS_HOST) {
       configScreen.style.display = "";
       document.getElementById("park").textContent = "choose a park";
@@ -657,10 +738,19 @@ function render() {
   }
 
   renderMyStatus();
+  renderScanTool();
 }
 
 ws.onmessage = (event) => {
-  latest = JSON.parse(event.data);
+  const data = JSON.parse(event.data);
+  // A scan_nearby reply is a private one-off answer to this connection's own
+  // request (see ScanOutcome's serde tag) — never a Scoreboard push, which
+  // has no "type" field at all.
+  if (data.type === "nearby_count" || data.type === "on_cooldown" || data.type === "unavailable") {
+    handleScanReply(data);
+    return;
+  }
+  latest = data;
   render();
 };
 

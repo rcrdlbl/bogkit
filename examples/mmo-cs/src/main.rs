@@ -18,6 +18,7 @@ mod domain;
 mod matches;
 mod parks;
 mod protocol;
+mod scan;
 mod web;
 mod win;
 
