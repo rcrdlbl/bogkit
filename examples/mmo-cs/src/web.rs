@@ -7,10 +7,14 @@
 use std::sync::mpsc;
 
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::response::Html;
+use axum::http::{StatusCode, header};
+use axum::response::{Html, IntoResponse};
 use axum::routing::get;
+use qrcode::QrCode;
+use qrcode::render::svg;
+use serde::Deserialize;
 use tokio::sync::watch;
 
 use crate::domain::Scoreboard;
@@ -24,6 +28,7 @@ pub async fn serve(msg_tx: mpsc::Sender<ClientMsg>, state_rx: watch::Receiver<Sc
     let app = Router::new()
         .route("/", get(index))
         .route("/ws", get(ws_upgrade))
+        .route("/qr", get(qr_code))
         .with_state((msg_tx, state_rx));
 
     let port: u16 = std::env::var("MMO_PORT")
@@ -86,6 +91,31 @@ async fn index() -> Html<String> {
     Html(PAGE_TEMPLATE.replacen("__PARKS_JSON__", &parks_json, 1))
 }
 
+#[derive(Deserialize)]
+struct QrParams {
+    data: String,
+}
+
+/// Renders `?data=` as a QR code SVG. Generated server-side (rather than an
+/// embedded JS encoder) so the page stays self-contained without vendoring
+/// a QR algorithm — and server-generated from `location.origin` client-side
+/// means it always encodes whatever URL is actually working for the phone
+/// that's viewing it, not a guessed one. Served from the same origin, so it
+/// still works with no outside internet access, matching this page's
+/// convention of no external requests.
+async fn qr_code(Query(params): Query<QrParams>) -> impl IntoResponse {
+    let Ok(code) = QrCode::new(params.data.as_bytes()) else {
+        return (StatusCode::BAD_REQUEST, "data too long for a QR code").into_response();
+    };
+    let svg = code
+        .render::<svg::Color>()
+        .min_dimensions(240, 240)
+        .dark_color(svg::Color("#000"))
+        .light_color(svg::Color("#fff"))
+        .build();
+    ([(header::CONTENT_TYPE, "image/svg+xml")], svg).into_response()
+}
+
 const PAGE_TEMPLATE: &str = r#"<!doctype html>
 <html lang="en">
 <head>
@@ -116,6 +146,9 @@ const PAGE_TEMPLATE: &str = r#"<!doctype html>
   .park-result:hover { background: #eee; }
   #park-selected { margin-top: 0.5rem; font-weight: bold; }
   #create-match { width: 100%; padding: 0.6rem; font-size: 1rem; margin-top: 1rem; }
+  #qr-invite { text-align: center; margin: 1rem 0; }
+  #qr-invite img { border: 1px solid #ddd; border-radius: 6px; }
+  #qr-invite p { margin: 0 0 0.4rem; color: #555; font-size: 0.9rem; }
 </style>
 </head>
 <body>
@@ -139,6 +172,10 @@ const PAGE_TEMPLATE: &str = r#"<!doctype html>
 
 <div id="my-status"></div>
 <div id="banner"></div>
+<div id="qr-invite" style="display:none">
+  <p>scan to join on your phone</p>
+  <img id="qr-img" width="180" height="180" alt="scan to open this match">
+</div>
 <div class="teams" id="teams">
   <div class="team" id="team-court_square">
     <h3>Team Court Square</h3>
@@ -181,6 +218,11 @@ let lastFix = null; // { lat, lon } from the most recent geolocation fix
 const ws = new WebSocket(`ws://${location.host}/ws`);
 
 function send(msg) { ws.send(JSON.stringify(msg)); }
+
+// The join URL never changes, so this is set once — only #qr-invite's
+// visibility toggles per battle status, in render().
+document.getElementById("qr-img").src =
+  `/qr?data=${encodeURIComponent(location.origin + "/")}`;
 
 document.getElementById("join-court_square").onclick = () => join("court_square");
 document.getElementById("join-church_ave").onclick = () => join("church_ave");
@@ -314,6 +356,7 @@ function render() {
   const startBtn = document.getElementById("start");
   const statusEl = document.getElementById("status");
   const banner = document.getElementById("banner");
+  const qrInvite = document.getElementById("qr-invite");
 
   if (!battle.park) {
     // nobody's picked a battleground yet — show only the search/duration
@@ -321,6 +364,7 @@ function render() {
     configScreen.style.display = "";
     teamsEl.style.display = "none";
     startBtn.style.display = "none";
+    qrInvite.style.display = "none";
     banner.classList.remove("show");
     document.getElementById("park").textContent = "choose a park";
     statusEl.textContent = "pick a battleground and match length to open the lobby";
@@ -329,6 +373,8 @@ function render() {
   }
   configScreen.style.display = "none";
   teamsEl.style.display = "";
+  // only useful while players can still join — roster locks once Active
+  qrInvite.style.display = battle.status === "pending" ? "" : "none";
 
   document.getElementById("park").textContent = battle.park.name;
 
