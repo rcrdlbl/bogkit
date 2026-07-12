@@ -1,56 +1,139 @@
-//! HTTP + websocket surface. One inline page handles both the team-join
-//! step and phone location streaming — a player just opens this same URL
-//! on the phone they'll carry into the park, no separate "phone link" or
-//! QR handoff needed. No static files, no template engine, matching
-//! `examples/chat`'s convention.
+//! HTTP + websocket surface. Three kinds of page, all inline HTML/JS
+//! constants — no static files, no template engine, matching `examples/chat`'s
+//! convention:
+//!
+//!  - `/` — the homepage: a "host a new match" button and a live, browsable
+//!    list of running (and recently-ended) matches, fed by `/lobby/ws`.
+//!  - `/match/:id` — the player link: join a team, stream location once the
+//!    battle's active. Shared freely — it carries no special privilege.
+//!  - `/match/:id/host/:token` — the host link: configure the battleground +
+//!    match length and start the battle, but never join a team. `:token` is
+//!    checked against the match's `host_token`; get it wrong and you get the
+//!    same 404 as a nonexistent match, so a bad guess can't even confirm the
+//!    match exists.
+//!
+//! Both match pages share one template (`MATCH_PAGE_TEMPLATE`), parameterized
+//! by whether the viewer is the host — the host's own websocket connection
+//! carries the token (`/match/:id/ws?host=...`), which is what actually gates
+//! `ConfigureBattle`/`StartBattle` in [`handle_socket`]; the UI just hides
+//! those controls from non-hosts as a second, non-load-bearing layer.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::mpsc;
 
+use axum::Json;
 use axum::Router;
-use axum::extract::{Query, State};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
-use axum::response::{Html, IntoResponse};
-use axum::routing::get;
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{get, post};
 use qrcode::QrCode;
 use qrcode::render::svg;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
-use crate::domain::Scoreboard;
+use crate::domain::{MatchSummary, Scoreboard};
+use crate::matches::Registry;
 use crate::parks;
 use crate::protocol::ClientMsg;
 
-type AppState = (mpsc::Sender<ClientMsg>, watch::Receiver<Scoreboard>);
+type AppState = Arc<Registry>;
 
 #[tokio::main]
-pub async fn serve(msg_tx: mpsc::Sender<ClientMsg>, state_rx: watch::Receiver<Scoreboard>) {
+pub async fn serve(registry: Arc<Registry>) {
     let app = Router::new()
-        .route("/", get(index))
-        .route("/ws", get(ws_upgrade))
+        .route("/", get(lobby_page))
+        .route("/lobby/ws", get(lobby_ws_upgrade))
+        .route("/matches", post(create_match))
+        .route("/match/{id}", get(match_page))
+        .route("/match/{id}/host/{token}", get(match_host_page))
+        .route("/match/{id}/ws", get(match_ws_upgrade))
         .route("/qr", get(qr_code))
-        .with_state((msg_tx, state_rx));
+        .with_state(registry);
 
     let port: u16 = std::env::var("MMO_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
     let addr = format!("0.0.0.0:{port}");
-    println!("area denial running on http://localhost:{port} (websocket at /ws)");
+    println!("area denial running on http://localhost:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn ws_upgrade(
-    State(state): State<AppState>,
+#[derive(Serialize)]
+struct CreateMatchResponse {
+    id: u64,
+    host_token: String,
+}
+
+async fn create_match(State(registry): State<AppState>) -> Json<CreateMatchResponse> {
+    let (id, host_token) = registry.create_match();
+    Json(CreateMatchResponse { id, host_token })
+}
+
+async fn match_page(State(registry): State<AppState>, Path(id): Path<u64>) -> Response {
+    if registry.get(id).is_none() {
+        return (StatusCode::NOT_FOUND, "no such match").into_response();
+    }
+    Html(render_match_page(id, false, "")).into_response()
+}
+
+async fn match_host_page(
+    State(registry): State<AppState>,
+    Path((id, token)): Path<(u64, String)>,
+) -> Response {
+    match registry.get(id) {
+        Some(handle) if handle.host_token == token => {
+            Html(render_match_page(id, true, &token)).into_response()
+        }
+        // Deliberately the same response whether the match doesn't exist or
+        // the token is just wrong — a bad guess shouldn't be able to
+        // distinguish the two.
+        _ => (StatusCode::NOT_FOUND, "no such match").into_response(),
+    }
+}
+
+fn render_match_page(id: u64, is_host: bool, host_token: &str) -> String {
+    let parks_json = serde_json::to_string(parks::all()).unwrap_or_else(|_| "[]".to_string());
+    MATCH_PAGE_TEMPLATE
+        .replacen("__PARKS_JSON__", &parks_json, 1)
+        .replacen("__MATCH_ID__", &id.to_string(), 1)
+        .replacen("__IS_HOST__", &is_host.to_string(), 1)
+        .replacen("__HOST_TOKEN__", host_token, 1)
+}
+
+#[derive(Deserialize)]
+struct MatchWsParams {
+    host: Option<String>,
+}
+
+async fn match_ws_upgrade(
+    State(registry): State<AppState>,
+    Path(id): Path<u64>,
+    Query(params): Query<MatchWsParams>,
     ws: WebSocketUpgrade,
-) -> impl axum::response::IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+) -> Response {
+    let Some(handle) = registry.get(id) else {
+        return (StatusCode::NOT_FOUND, "no such match").into_response();
+    };
+    // Only a connection presenting the exact host token may later send
+    // ConfigureBattle/StartBattle — see handle_socket. Everyone else is
+    // treated as a plain player connection.
+    let is_host = params.host.as_deref() == Some(handle.host_token.as_str());
+    ws.on_upgrade(move |socket| handle_socket(socket, handle.msg_tx, handle.state_rx, is_host))
 }
 
 /// Per-client task: push every new scoreboard down, feed every incoming
-/// client message into the ingest thread.
-async fn handle_socket(mut socket: WebSocket, (msg_tx, mut state_rx): AppState) {
+/// client message into the match's ingest thread.
+async fn handle_socket(
+    mut socket: WebSocket,
+    msg_tx: mpsc::Sender<ClientMsg>,
+    mut state_rx: watch::Receiver<Scoreboard>,
+    is_host: bool,
+) {
     let state_json = |s: &Scoreboard| serde_json::to_string(s).unwrap();
 
     let hello = state_json(&state_rx.borrow_and_update());
@@ -62,7 +145,7 @@ async fn handle_socket(mut socket: WebSocket, (msg_tx, mut state_rx): AppState) 
         tokio::select! {
             changed = state_rx.changed() => {
                 if changed.is_err() {
-                    return; // ingest thread gone
+                    return; // match thread gone
                 }
                 let update = state_json(&state_rx.borrow_and_update());
                 if socket.send(Message::text(update)).await.is_err() {
@@ -75,8 +158,14 @@ async fn handle_socket(mut socket: WebSocket, (msg_tx, mut state_rx): AppState) 
                 };
                 match serde_json::from_str::<ClientMsg>(&text) {
                     Ok(msg) => {
-                        if msg_tx.send(msg).is_err() {
-                            return; // ingest thread gone
+                        let host_only = matches!(
+                            msg,
+                            ClientMsg::ConfigureBattle { .. } | ClientMsg::StartBattle
+                        );
+                        if host_only && !is_host {
+                            eprintln!("dropping host-only message from a non-host connection");
+                        } else if msg_tx.send(msg).is_err() {
+                            return; // match thread gone
                         }
                     }
                     Err(e) => eprintln!("dropping malformed client message: {e}"),
@@ -86,9 +175,54 @@ async fn handle_socket(mut socket: WebSocket, (msg_tx, mut state_rx): AppState) 
     }
 }
 
-async fn index() -> Html<String> {
-    let parks_json = serde_json::to_string(parks::all()).unwrap_or_else(|_| "[]".to_string());
-    Html(PAGE_TEMPLATE.replacen("__PARKS_JSON__", &parks_json, 1))
+async fn lobby_page() -> Html<&'static str> {
+    Html(LOBBY_PAGE_TEMPLATE)
+}
+
+async fn lobby_ws_upgrade(State(registry): State<AppState>, ws: WebSocketUpgrade) -> Response {
+    let rx = registry.subscribe_lobby();
+    ws.on_upgrade(move |socket| handle_lobby_socket(socket, rx))
+        .into_response()
+}
+
+/// Push-only: forwards the shared match map to the homepage on every
+/// change. Still watches for the client closing the socket (rather than
+/// only `send` failing after some later change) so an abandoned tab's task
+/// doesn't linger until the next unrelated match update.
+async fn handle_lobby_socket(
+    mut socket: WebSocket,
+    mut rx: watch::Receiver<HashMap<u64, MatchSummary>>,
+) {
+    let to_json = |m: &HashMap<u64, MatchSummary>| {
+        let mut list: Vec<&MatchSummary> = m.values().collect();
+        list.sort_by_key(|m| std::cmp::Reverse(m.id)); // newest first
+        serde_json::to_string(&list).unwrap()
+    };
+
+    let hello = to_json(&rx.borrow_and_update());
+    if socket.send(Message::text(hello)).await.is_err() {
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            changed = rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let update = to_json(&rx.borrow_and_update());
+                if socket.send(Message::text(update)).await.is_err() {
+                    return;
+                }
+            }
+            incoming = socket.recv() => {
+                if incoming.is_none() {
+                    return; // client closed
+                }
+                // this socket is push-only; any incoming frame is ignored
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -116,7 +250,100 @@ async fn qr_code(Query(params): Query<QrParams>) -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "image/svg+xml")], svg).into_response()
 }
 
-const PAGE_TEMPLATE: &str = r#"<!doctype html>
+const LOBBY_PAGE_TEMPLATE: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>area denial</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.25rem; }
+  #host-btn { width: 100%; padding: 0.75rem; font-size: 1rem; margin: 1rem 0; }
+  .match { border: 1px solid #888; border-radius: 6px; padding: 0.75rem; margin-bottom: 0.75rem; }
+  .match h3 { margin: 0 0 0.25rem; font-size: 1rem; font-weight: normal; }
+  .match .meta { color: #555; font-size: 0.9rem; }
+  .match a.join { display: inline-block; margin-top: 0.5rem; }
+  .status { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 3px; font-size: 0.75rem; margin-right: 0.4rem; }
+  .status.pending { background: #ddd; }
+  .status.active { background: #cfe8cf; }
+  .status.ended { background: #eee; color: #888; }
+  #empty { color: #888; }
+</style>
+</head>
+<body>
+<h1>area denial</h1>
+<button id="host-btn">host a new match</button>
+<div id="matches"></div>
+<p id="empty">no matches running right now — host one to get started.</p>
+<script>
+document.getElementById("host-btn").onclick = async () => {
+  const res = await fetch("/matches", { method: "POST" });
+  const { id, host_token } = await res.json();
+  location.href = `/match/${id}/host/${host_token}`;
+};
+
+// Ended matches stay visible for a while so people can see the outcome,
+// then quietly drop off the list — computed client-side off `ends_at_ms`
+// so no server-side cleanup timer is needed.
+const ENDED_GRACE_MS = 10 * 60 * 1000;
+
+let latestMatches = [];
+
+function statusLabel(m) {
+  if (m.status === "pending") return "lobby";
+  if (m.status === "active") return "active";
+  return "ended";
+}
+
+function outcomeText(m) {
+  if (m.status !== "ended") return "";
+  const o = m.outcome;
+  if (!o) return "ended";
+  if (o.kind === "tie") return "ended in a tie";
+  const label = o.winner === "court_square" ? "Team Court Square" : "Team Church Ave";
+  const via = o.kind === "elimination" ? "by elimination" : "on time";
+  return `${label} won ${via}`;
+}
+
+function render() {
+  const container = document.getElementById("matches");
+  const empty = document.getElementById("empty");
+  const now = Date.now();
+  const visible = latestMatches.filter(
+    (m) => m.status !== "ended" || (m.ends_at_ms && now - m.ends_at_ms < ENDED_GRACE_MS),
+  );
+
+  empty.style.display = visible.length === 0 ? "" : "none";
+  container.innerHTML = "";
+  for (const m of visible) {
+    const el = document.createElement("div");
+    el.className = "match";
+    const park = m.park_name ?? "choosing a battleground…";
+    const outcome = outcomeText(m);
+    el.innerHTML = `
+      <h3><span class="status ${m.status}">${statusLabel(m)}</span>${park}</h3>
+      <div class="meta">Court Square ${m.court_square_members} &middot; Church Ave ${m.church_ave_members}${outcome ? " &middot; " + outcome : ""}</div>
+      <a class="join" href="/match/${m.id}">${m.status === "ended" ? "view" : "join"}</a>
+    `;
+    container.appendChild(el);
+  }
+}
+
+const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
+const ws = new WebSocket(`${wsProtocol}//${location.host}/lobby/ws`);
+ws.onmessage = (event) => {
+  latestMatches = JSON.parse(event.data);
+  render();
+};
+
+// re-check the ended grace window even between server pushes
+setInterval(render, 30000);
+</script>
+</body>
+</html>"#;
+
+const MATCH_PAGE_TEMPLATE: &str = r#"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -149,9 +376,11 @@ const PAGE_TEMPLATE: &str = r#"<!doctype html>
   #qr-invite { text-align: center; margin: 1rem 0; }
   #qr-invite img { border: 1px solid #ddd; border-radius: 6px; }
   #qr-invite p { margin: 0 0 0.4rem; color: #555; font-size: 0.9rem; }
+  #back-home { color: #555; font-size: 0.9rem; }
 </style>
 </head>
 <body>
+<p><a id="back-home" href="/">&larr; all matches</a></p>
 <h1>area denial: <span id="park">connecting...</span></h1>
 <div id="status"></div>
 
@@ -199,44 +428,52 @@ const PAGE_TEMPLATE: &str = r#"<!doctype html>
 </p>
 <script>
 const PARKS = __PARKS_JSON__; // [{id, name, bbox}, ...] — the full catalog, embedded so search needs no round trip
-const PLAYER_KEY = "mmo_player_id";
-const TEAM_KEY = "mmo_team";
+const MATCH_ID = __MATCH_ID__;
+const IS_HOST = __IS_HOST__; // the host configures + starts the match but never joins a team
+const HOST_TOKEN = "__HOST_TOKEN__";
+const PLAYER_KEY = `mmo_player_id`;
+const TEAM_KEY = `mmo_team_${MATCH_ID}`;
 
 let playerId = localStorage.getItem(PLAYER_KEY);
 if (!playerId) {
   playerId = crypto.randomUUID();
   localStorage.setItem(PLAYER_KEY, playerId);
 }
-let myTeam = localStorage.getItem(TEAM_KEY); // "court_square" | "church_ave" | null
+let myTeam = IS_HOST ? null : localStorage.getItem(TEAM_KEY); // "court_square" | "church_ave" | null
 
 let latest = null; // last scoreboard from the server
-let lastBattleId = null; // detects the server moving on to a fresh battle
 let watchId = null;
 let lastPingAt = 0;
 let lastFix = null; // { lat, lon } from the most recent geolocation fix
 
 const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
-const ws = new WebSocket(`${wsProtocol}//${location.host}/ws`);
+const wsUrl = IS_HOST
+  ? `${wsProtocol}//${location.host}/match/${MATCH_ID}/ws?host=${encodeURIComponent(HOST_TOKEN)}`
+  : `${wsProtocol}//${location.host}/match/${MATCH_ID}/ws`;
+const ws = new WebSocket(wsUrl);
 
 function send(msg) { ws.send(JSON.stringify(msg)); }
 
 // The join URL never changes, so this is set once — only #qr-invite's
-// visibility toggles per battle status, in render().
+// visibility toggles per battle status, in render(). Always the plain
+// player link, even on the host's own page — the host link is never
+// meant to be shared.
 document.getElementById("qr-img").src =
-  `/qr?data=${encodeURIComponent(location.origin + "/")}`;
+  `/qr?data=${encodeURIComponent(location.origin + "/match/" + MATCH_ID)}`;
 
 document.getElementById("join-court_square").onclick = () => join("court_square");
 document.getElementById("join-church_ave").onclick = () => join("church_ave");
 document.getElementById("start").onclick = () => send({ type: "start_battle" });
 
 function join(team) {
+  if (IS_HOST) return; // the host never joins a team
   myTeam = team;
   localStorage.setItem(TEAM_KEY, team);
   send({ type: "join", player: playerId, team });
   render();
 }
 
-// --- park search + match-length menu, shown while battle.park is null ---
+// --- park search + match-length menu, host-only, shown while battle.park is null ---
 let selectedParkId = null;
 const parkSearch = document.getElementById("park-search");
 const parkResults = document.getElementById("park-results");
@@ -281,10 +518,10 @@ createMatchBtn.onclick = () => {
   });
 };
 
-renderParkResults(""); // browsable from the start, narrows as you type
+if (IS_HOST) renderParkResults(""); // browsable from the start, narrows as you type
 
 function startStreaming() {
-  if (watchId !== null || !navigator.geolocation) return;
+  if (IS_HOST || watchId !== null || !navigator.geolocation) return;
   watchId = navigator.geolocation.watchPosition(
     (pos) => {
       const now = Date.now();
@@ -309,12 +546,13 @@ function inBounds(bbox, lat, lon) {
   return lon >= bbox.min_lon && lon <= bbox.max_lon && lat >= bbox.min_lat && lat <= bbox.max_lat;
 }
 
-// Shown only while actively streaming (on a team, battle active). Computed
-// entirely client-side from the last GPS fix and the battle's bbox (already
-// in every scoreboard) — no extra server round-trip needed.
+// Shown only while actively streaming (on a team, battle active) — never
+// applies to the host, who has no team and never streams location.
+// Computed entirely client-side from the last GPS fix and the battle's
+// bbox (already in every scoreboard) — no extra server round-trip needed.
 function renderMyStatus() {
   const el = document.getElementById("my-status");
-  if (!latest || !myTeam || !latest.battle.park || latest.battle.status !== "active") {
+  if (IS_HOST || !latest || !myTeam || !latest.battle.park || latest.battle.status !== "active") {
     el.textContent = "";
     el.className = "";
     return;
@@ -343,15 +581,6 @@ function render() {
   const { battle, court_square, church_ave } = latest;
   const teams = { court_square, church_ave };
 
-  // The server starts a fresh battle immediately after the last one ends —
-  // clear a stale team choice so the join/start flow is ready to go again
-  // instead of leaving join buttons hidden and "start" stuck disabled.
-  if (lastBattleId !== null && battle.id !== lastBattleId && myTeam) {
-    myTeam = null;
-    localStorage.removeItem(TEAM_KEY);
-  }
-  lastBattleId = battle.id;
-
   const configScreen = document.getElementById("config-screen");
   const teamsEl = document.getElementById("teams");
   const startBtn = document.getElementById("start");
@@ -360,19 +589,25 @@ function render() {
   const qrInvite = document.getElementById("qr-invite");
 
   if (!battle.park) {
-    // nobody's picked a battleground yet — show only the search/duration
-    // menu and hide the join/start lobby until configure_battle lands
-    configScreen.style.display = "";
+    // nobody's picked a battleground yet — the host sees the search/duration
+    // menu, everyone else just waits for it
     teamsEl.style.display = "none";
     startBtn.style.display = "none";
     qrInvite.style.display = "none";
     banner.classList.remove("show");
-    document.getElementById("park").textContent = "choose a park";
-    statusEl.textContent = "pick a battleground and match length to open the lobby";
     document.getElementById("my-status").textContent = "";
+    if (IS_HOST) {
+      configScreen.style.display = "";
+      document.getElementById("park").textContent = "choose a park";
+      statusEl.textContent = "pick a battleground and match length to open the lobby";
+    } else {
+      configScreen.style.display = "none";
+      document.getElementById("park").textContent = "waiting for host...";
+      statusEl.textContent = "waiting for the host to choose a battleground and match length";
+    }
     return;
   }
-  configScreen.style.display = "none";
+  configScreen.style.display = "none"; // locked in once chosen — the host doesn't re-configure mid-lobby
   teamsEl.style.display = "";
   // only useful while players can still join — roster locks once Active
   qrInvite.style.display = battle.status === "pending" ? "" : "none";
@@ -388,18 +623,20 @@ function render() {
       battle.status === "pending" ? "" : `${t.in_bounds}/${t.members} in bounds (${pct}%)`;
     document.getElementById(`team-${key}`).classList.toggle("mine", myTeam === key);
     const btn = document.getElementById(`join-${key}`);
-    btn.style.display = myTeam || battle.status !== "pending" ? "none" : "";
+    btn.style.display = IS_HOST || myTeam || battle.status !== "pending" ? "none" : "";
   }
 
-  startBtn.style.display = battle.status === "pending" && myTeam ? "" : "none";
+  startBtn.style.display = battle.status === "pending" && (IS_HOST || myTeam) ? "" : "none";
   startBtn.disabled = court_square.members === 0 || church_ave.members === 0;
 
   banner.classList.remove("show");
 
   if (battle.status === "pending") {
-    statusEl.textContent = myTeam
+    statusEl.textContent = IS_HOST
       ? "waiting for both teams to have at least one member, then start the battle"
-      : "pick a team to join";
+      : myTeam
+        ? "waiting for both teams to have at least one member, then the host starts the battle"
+        : "pick a team to join";
   } else if (battle.status === "active") {
     const remaining = (battle.ends_at_ms ?? 0) - Date.now();
     statusEl.textContent = `battle active — time remaining ${fmtCountdown(remaining)}`;
