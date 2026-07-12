@@ -215,7 +215,8 @@ let watchId = null;
 let lastPingAt = 0;
 let lastFix = null; // { lat, lon } from the most recent geolocation fix
 
-const ws = new WebSocket(`ws://${location.host}/ws`);
+const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
+const ws = new WebSocket(`${wsProtocol}//${location.host}/ws`);
 
 function send(msg) { ws.send(JSON.stringify(msg)); }
 
